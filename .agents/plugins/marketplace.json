@@ -1,0 +1,20 @@
+{
+  "name": "apple-mail-local",
+  "interface": {
+    "displayName": "Apple Mail Local"
+  },
+  "plugins": [
+    {
+      "name": "apple-mail-local",
+      "source": {
+        "source": "local",
+        "path": "./plugins/apple-mail-local"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

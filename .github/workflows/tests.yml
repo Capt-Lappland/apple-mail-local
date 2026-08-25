@@ -1,0 +1,26 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run non-invasive test suite
+        run: >-
+          /usr/bin/python3 -m unittest discover
+          -s ./plugins/apple-mail-local/tests
+          -p 'test_*.py' -v
+      - name: Compile JXA bridge
+        run: |
+          output_dir="$(mktemp -d)"
+          /usr/bin/osacompile -l JavaScript \
+            -o "$output_dir/mail.scpt" \
+            ./plugins/apple-mail-local/scripts/mail_automation.jxa

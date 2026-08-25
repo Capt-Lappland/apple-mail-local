@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "apple_mail": {
+      "title": "Apple Mail Local",
+      "description": "Local, read-only-by-default access to accounts already configured in Apple Mail.app.",
+      "cwd": ".",
+      "command": "/usr/bin/python3",
+      "args": ["./scripts/server.py"],
+      "env_vars": ["APPLE_MAIL_ENABLE_DRAFTS"],
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 60
+    }
+  }
+}

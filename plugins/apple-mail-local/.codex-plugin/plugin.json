@@ -1,0 +1,36 @@
+{
+  "name": "apple-mail-local",
+  "version": "0.1.1",
+  "description": "Read Apple Mail accounts and messages through local macOS automation.",
+  "author": {
+    "name": "Runze Wang",
+    "url": "https://github.com/Capt-Lappland"
+  },
+  "homepage": "https://github.com/Capt-Lappland/apple-mail-local",
+  "repository": "https://github.com/Capt-Lappland/apple-mail-local",
+  "license": "MIT",
+  "keywords": [
+    "apple-mail",
+    "macos",
+    "email",
+    "local",
+    "read-only"
+  ],
+  "interface": {
+    "displayName": "Apple Mail Local",
+    "shortDescription": "Safely inspect Mail.app without storing credentials.",
+    "longDescription": "Lists accounts and mailboxes, searches recent messages, and reads message content through Apple Mail's supported automation interface. Read-only tools are enabled by default; reply drafts require an explicit local opt-in and confirmation.",
+    "developerName": "Runze Wang",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Optional Drafts"
+    ],
+    "defaultPrompt": [
+      "List the accounts configured in Apple Mail.",
+      "Find recent unread messages in Apple Mail.",
+      "Summarize an Apple Mail message without taking action."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

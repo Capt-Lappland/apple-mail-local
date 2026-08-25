@@ -1,0 +1,324 @@
+/* Apple Mail JXA bridge. Input and output are JSON on stdin/stdout. */
+"use strict";
+
+ObjC.import("Foundation");
+
+function readStandardInput() {
+  const handle = $.NSFileHandle.fileHandleWithStandardInput;
+  const data = handle.readDataToEndOfFile;
+  return ObjC.unwrap($.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding));
+}
+
+function stringValue(value) {
+  if (value === null || value === undefined) return "";
+  return String(value);
+}
+
+function safe(read, fallback) {
+  try {
+    const value = read();
+    return value === undefined || value === null ? fallback : value;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function isoDate(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function accountRecord(account) {
+  return {
+    id: stringValue(account.id()),
+    name: stringValue(account.name()),
+    enabled: Boolean(safe(() => account.enabled(), false)),
+    account_type: stringValue(safe(() => account.accountType(), "unknown")),
+    email_addresses: safe(() => account.emailAddresses(), []).map(stringValue),
+  };
+}
+
+function findAccount(Mail, accountId) {
+  const accounts = Mail.accounts();
+  for (const account of accounts) {
+    if (stringValue(account.id()) === accountId) return account;
+  }
+  throw new Error("Apple Mail account was not found. List accounts again.");
+}
+
+function childMailboxes(mailbox) {
+  return safe(() => mailbox.mailboxes(), []);
+}
+
+function walkMailbox(mailbox, prefix, output, accountId, state, depth) {
+  if (output.length >= state.limit) {
+    state.truncated = true;
+    return;
+  }
+  const name = stringValue(mailbox.name());
+  const path = prefix.concat([name]);
+  output.push({
+    account_id: accountId,
+    path: path,
+    name: name,
+    unread_count: Number(safe(() => mailbox.unreadCount(), 0)),
+    has_children: childMailboxes(mailbox).length > 0,
+  });
+  if (depth >= 31) {
+    if (childMailboxes(mailbox).length > 0) state.truncated = true;
+    return;
+  }
+  for (const child of childMailboxes(mailbox)) {
+    walkMailbox(child, path, output, accountId, state, depth + 1);
+  }
+}
+
+function resolveMailbox(account, path) {
+  let candidates = account.mailboxes();
+  let current = null;
+  for (const segment of path) {
+    current = null;
+    for (const mailbox of candidates) {
+      if (stringValue(mailbox.name()) === segment) {
+        current = mailbox;
+        break;
+      }
+    }
+    if (!current) throw new Error("Apple Mail mailbox path was not found. List mailboxes again.");
+    candidates = childMailboxes(current);
+  }
+  return current;
+}
+
+function mailboxPath(mailbox) {
+  const names = [];
+  let current = mailbox;
+  for (let depth = 0; current && depth < 32; depth += 1) {
+    const name = safe(() => current.name(), null);
+    if (!name) break;
+    names.unshift(stringValue(name));
+    const parent = safe(() => current.container(), null);
+    if (!parent || parent === current) break;
+    current = parent;
+  }
+  return names;
+}
+
+function mailboxAccountId(mailbox) {
+  return stringValue(mailbox.account().id());
+}
+
+function messageLocator(message) {
+  const box = message.mailbox();
+  return {
+    account_id: mailboxAccountId(box),
+    mailbox_path: mailboxPath(box),
+    message_id: stringValue(message.id()),
+  };
+}
+
+function messageMetadata(message) {
+  const box = message.mailbox();
+  return {
+    _locator: messageLocator(message),
+    account_id: mailboxAccountId(box),
+    mailbox_path: mailboxPath(box),
+    message_id: stringValue(safe(() => message.messageId(), "")),
+    subject: stringValue(safe(() => message.subject(), "")),
+    sender: stringValue(safe(() => message.sender(), "")),
+    date_received: isoDate(safe(() => message.dateReceived(), null)),
+    date_sent: isoDate(safe(() => message.dateSent(), null)),
+    is_read: Boolean(safe(() => message.readStatus(), false)),
+    is_flagged: Boolean(safe(() => message.flaggedStatus(), false)),
+    was_replied_to: Boolean(safe(() => message.wasRepliedTo(), false)),
+    size_bytes: Number(safe(() => message.messageSize(), 0)),
+  };
+}
+
+function recipientRecord(recipient) {
+  return {
+    name: stringValue(safe(() => recipient.name(), "")),
+    address: stringValue(safe(() => recipient.address(), "")),
+  };
+}
+
+function attachmentRecord(attachment) {
+  return {
+    id: stringValue(safe(() => attachment.id(), "")),
+    name: stringValue(safe(() => attachment.name(), "")),
+    mime_type: stringValue(safe(() => attachment.mimeType(), "")),
+    size_bytes: Number(safe(() => attachment.fileSize(), 0)),
+    downloaded: Boolean(safe(() => attachment.downloaded(), false)),
+  };
+}
+
+function resolveMessage(Mail, locator) {
+  const account = findAccount(Mail, locator.account_id);
+  const mailbox = resolveMailbox(account, locator.mailbox_path);
+  const wanted = stringValue(locator.message_id);
+  const exact = safe(() => mailbox.messages.whose({ id: Number(wanted) })(), []);
+  for (const message of exact) {
+    if (stringValue(message.id()) === wanted) return message;
+  }
+  const all = mailbox.messages();
+  for (const message of all) {
+    if (stringValue(message.id()) === wanted) return message;
+  }
+  throw new Error("Apple Mail message was not found. Search again; it may have been moved or removed.");
+}
+
+function recentMessages(mailbox, since) {
+  const filtered = safe(
+    () => mailbox.messages.whose({ dateReceived: { _greaterThan: since } })(),
+    null
+  );
+  return filtered === null ? mailbox.messages() : filtered;
+}
+
+function collectAllMailboxes(account, maximum) {
+  const output = [];
+  function visit(mailbox) {
+    if (output.length >= maximum) return;
+    output.push(mailbox);
+    for (const child of childMailboxes(mailbox)) visit(child);
+  }
+  for (const mailbox of account.mailboxes()) visit(mailbox);
+  return output;
+}
+
+function opListAccounts(Mail) {
+  return { accounts: Mail.accounts().map(accountRecord) };
+}
+
+function opListMailboxes(Mail, args) {
+  const accounts = args.account_id ? [findAccount(Mail, args.account_id)] : Mail.accounts();
+  const mailboxes = [];
+  const state = { limit: 1000, truncated: false };
+  for (const account of accounts) {
+    const accountId = stringValue(account.id());
+    for (const mailbox of account.mailboxes()) {
+      walkMailbox(mailbox, [], mailboxes, accountId, state, 0);
+    }
+  }
+  return { mailboxes: mailboxes, truncated: state.truncated };
+}
+
+function opSearchMessages(Mail, args) {
+  let boxes = [];
+  if (args.mailbox_scope === "mailbox") {
+    boxes = [resolveMailbox(findAccount(Mail, args.account_id), args.mailbox_path)];
+  } else if (args.mailbox_scope === "inbox") {
+    boxes = [Mail.inbox()];
+  } else {
+    const accounts = args.account_id ? [findAccount(Mail, args.account_id)] : Mail.accounts();
+    for (const account of accounts) {
+      boxes = boxes.concat(collectAllMailboxes(account, 75 - boxes.length));
+      if (boxes.length >= 75) break;
+    }
+  }
+
+  const since = new Date(Date.now() - args.days_back * 86400000);
+  const query = stringValue(args.query).toLocaleLowerCase();
+  const results = [];
+  let scanned = 0;
+  const maxScanned = Math.min(1000, Math.max(200, args.limit * 20));
+
+  outer: for (const box of boxes) {
+    for (const message of recentMessages(box, since)) {
+      if (scanned >= maxScanned) break outer;
+      scanned += 1;
+      const received = safe(() => message.dateReceived(), null);
+      if (received && new Date(received) < since) continue;
+      const actualBox = safe(() => message.mailbox(), null);
+      if (!actualBox) continue;
+      const accountId = mailboxAccountId(actualBox);
+      if (args.account_id && accountId !== args.account_id) continue;
+      const subject = stringValue(safe(() => message.subject(), ""));
+      const sender = stringValue(safe(() => message.sender(), ""));
+      let matches = !query || subject.toLocaleLowerCase().includes(query) || sender.toLocaleLowerCase().includes(query);
+      if (!matches && args.search_body) {
+        const content = stringValue(safe(() => message.content(), ""));
+        matches = content.slice(0, 100000).toLocaleLowerCase().includes(query);
+      }
+      if (matches) results.push(messageMetadata(message));
+    }
+  }
+
+  results.sort((left, right) => stringValue(right.date_received).localeCompare(stringValue(left.date_received)));
+  return {
+    messages: results.slice(0, args.limit),
+    scanned_count: scanned,
+    result_limit: args.limit,
+    scan_truncated: scanned >= maxScanned,
+    mailbox_limit_reached: args.mailbox_scope === "all" && boxes.length >= 75,
+  };
+}
+
+function opGetMessage(Mail, args) {
+  const message = resolveMessage(Mail, args.locator);
+  const metadata = messageMetadata(message);
+  delete metadata._locator;
+  const fullBody = stringValue(safe(() => message.content(), ""));
+  return Object.assign(metadata, {
+    reply_to: stringValue(safe(() => message.replyTo(), "")),
+    to: safe(() => message.toRecipients(), []).map(recipientRecord),
+    cc: safe(() => message.ccRecipients(), []).map(recipientRecord),
+    bcc: safe(() => message.bccRecipients(), []).map(recipientRecord),
+    attachments: safe(() => message.mailAttachments(), []).map(attachmentRecord),
+    body: fullBody.slice(0, args.max_body_chars),
+    body_truncated: fullBody.length > args.max_body_chars,
+    body_character_count: fullBody.length,
+  });
+}
+
+function opCreateReplyDraft(Mail, args) {
+  const original = resolveMessage(Mail, args.locator);
+  const draft = Mail.reply(original, {
+    openingWindow: false,
+    replyToAll: Boolean(args.reply_all),
+  });
+  const quoted = stringValue(safe(() => draft.content(), ""));
+  draft.content = args.include_original ? `${args.body}\n\n${quoted}` : args.body;
+  draft.visible = false;
+  Mail.save(draft);
+  return {
+    draft_id: stringValue(safe(() => draft.id(), "")),
+    subject: stringValue(safe(() => draft.subject(), "")),
+    visible: false,
+    sent: false,
+  };
+}
+
+function main() {
+  const request = JSON.parse(readStandardInput());
+  const args = request.arguments || {};
+  if (request.operation === "healthcheck") {
+    return JSON.stringify({ ok: true });
+  }
+  const Mail = Application("Mail");
+  Mail.includeStandardAdditions = false;
+  let result;
+  switch (request.operation) {
+    case "list_accounts":
+      result = opListAccounts(Mail);
+      break;
+    case "list_mailboxes":
+      result = opListMailboxes(Mail, args);
+      break;
+    case "search_messages":
+      result = opSearchMessages(Mail, args);
+      break;
+    case "get_message":
+      result = opGetMessage(Mail, args);
+      break;
+    case "create_reply_draft":
+      result = opCreateReplyDraft(Mail, args);
+      break;
+    default:
+      throw new Error("Unsupported Apple Mail operation.");
+  }
+  return JSON.stringify(result);
+}
+
+main();
