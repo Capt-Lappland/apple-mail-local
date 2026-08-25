@@ -58,18 +58,19 @@ function walkMailbox(mailbox, prefix, output, accountId, state, depth) {
   }
   const name = stringValue(mailbox.name());
   const path = prefix.concat([name]);
+  const children = childMailboxes(mailbox);
   output.push({
     account_id: accountId,
     path: path,
     name: name,
     unread_count: Number(safe(() => mailbox.unreadCount(), 0)),
-    has_children: childMailboxes(mailbox).length > 0,
+    has_children: children.length > 0,
   });
   if (depth >= 31) {
-    if (childMailboxes(mailbox).length > 0) state.truncated = true;
+    if (children.length > 0) state.truncated = true;
     return;
   }
-  for (const child of childMailboxes(mailbox)) {
+  for (const child of children) {
     walkMailbox(child, path, output, accountId, state, depth + 1);
   }
 }
@@ -109,25 +110,45 @@ function mailboxAccountId(mailbox) {
   return stringValue(mailbox.account().id());
 }
 
-function messageLocator(message) {
-  const box = message.mailbox();
+function mailboxContext(mailbox, knownAccountId) {
   return {
-    account_id: mailboxAccountId(box),
-    mailbox_path: mailboxPath(box),
-    message_id: stringValue(message.id()),
+    account_id: knownAccountId === undefined ? mailboxAccountId(mailbox) : knownAccountId,
+    mailbox_path: mailboxPath(mailbox),
   };
 }
 
-function messageMetadata(message) {
-  const box = message.mailbox();
+function messageMetadata(message, snapshot) {
+  const known = snapshot || {};
+  const box = Object.prototype.hasOwnProperty.call(known, "box")
+    ? known.box
+    : message.mailbox();
+  const context = Object.prototype.hasOwnProperty.call(known, "context")
+    ? known.context
+    : mailboxContext(box);
+  const automationId = Object.prototype.hasOwnProperty.call(known, "automation_id")
+    ? known.automation_id
+    : stringValue(safe(() => message.id(), ""));
+  const subject = Object.prototype.hasOwnProperty.call(known, "subject")
+    ? known.subject
+    : stringValue(safe(() => message.subject(), ""));
+  const sender = Object.prototype.hasOwnProperty.call(known, "sender")
+    ? known.sender
+    : stringValue(safe(() => message.sender(), ""));
+  const dateReceived = Object.prototype.hasOwnProperty.call(known, "date_received")
+    ? known.date_received
+    : isoDate(safe(() => message.dateReceived(), null));
   return {
-    _locator: messageLocator(message),
-    account_id: mailboxAccountId(box),
-    mailbox_path: mailboxPath(box),
+    _locator: {
+      account_id: context.account_id,
+      mailbox_path: context.mailbox_path,
+      message_id: automationId,
+    },
+    account_id: context.account_id,
+    mailbox_path: context.mailbox_path,
     message_id: stringValue(safe(() => message.messageId(), "")),
-    subject: stringValue(safe(() => message.subject(), "")),
-    sender: stringValue(safe(() => message.sender(), "")),
-    date_received: isoDate(safe(() => message.dateReceived(), null)),
+    subject: subject,
+    sender: sender,
+    date_received: dateReceived,
     date_sent: isoDate(safe(() => message.dateSent(), null)),
     is_read: Boolean(safe(() => message.readStatus(), false)),
     is_flagged: Boolean(safe(() => message.flaggedStatus(), false)),
@@ -220,20 +241,33 @@ function opSearchMessages(Mail, args) {
 
   const since = new Date(Date.now() - args.days_back * 86400000);
   const query = stringValue(args.query).toLocaleLowerCase();
-  const results = [];
+  const candidates = [];
+  const contextByBox = {};
+  const usesUnifiedInbox = args.mailbox_scope === "inbox";
+  if (args.mailbox_scope === "mailbox") {
+    contextByBox[0] = {
+      account_id: args.account_id,
+      mailbox_path: args.mailbox_path,
+    };
+  }
   let scanned = 0;
   const maxScanned = Math.min(1000, Math.max(200, args.limit * 20));
 
-  outer: for (const box of boxes) {
+  outer: for (let boxIndex = 0; boxIndex < boxes.length; boxIndex += 1) {
+    const box = boxes[boxIndex];
     for (const message of recentMessages(box, since)) {
       if (scanned >= maxScanned) break outer;
       scanned += 1;
       const received = safe(() => message.dateReceived(), null);
       if (received && new Date(received) < since) continue;
-      const actualBox = safe(() => message.mailbox(), null);
-      if (!actualBox) continue;
-      const accountId = mailboxAccountId(actualBox);
-      if (args.account_id && accountId !== args.account_id) continue;
+      let actualBox = usesUnifiedInbox ? null : box;
+      let accountId = usesUnifiedInbox ? undefined : args.account_id;
+      if (args.account_id && usesUnifiedInbox) {
+        actualBox = safe(() => message.mailbox(), null);
+        if (!actualBox) continue;
+        accountId = mailboxAccountId(actualBox);
+        if (accountId !== args.account_id) continue;
+      }
       const subject = stringValue(safe(() => message.subject(), ""));
       const sender = stringValue(safe(() => message.sender(), ""));
       let matches = !query || subject.toLocaleLowerCase().includes(query) || sender.toLocaleLowerCase().includes(query);
@@ -241,13 +275,40 @@ function opSearchMessages(Mail, args) {
         const content = stringValue(safe(() => message.content(), ""));
         matches = content.slice(0, 100000).toLocaleLowerCase().includes(query);
       }
-      if (matches) results.push(messageMetadata(message));
+      if (matches) {
+        candidates.push({
+          message: message,
+          received: isoDate(received),
+          subject: subject,
+          sender: sender,
+          box: actualBox,
+          box_index: boxIndex,
+          account_id: accountId,
+        });
+      }
     }
   }
 
-  results.sort((left, right) => stringValue(right.date_received).localeCompare(stringValue(left.date_received)));
+  candidates.sort((left, right) => stringValue(right.received).localeCompare(stringValue(left.received)));
+  const results = [];
+  for (const candidate of candidates.slice(0, args.limit)) {
+    const actualBox = candidate.box || safe(() => candidate.message.mailbox(), null);
+    if (!actualBox) continue;
+    let context = usesUnifiedInbox ? null : contextByBox[candidate.box_index];
+    if (!context) {
+      context = mailboxContext(actualBox, candidate.account_id);
+      if (!usesUnifiedInbox) contextByBox[candidate.box_index] = context;
+    }
+    results.push(messageMetadata(candidate.message, {
+      box: actualBox,
+      context: context,
+      subject: candidate.subject,
+      sender: candidate.sender,
+      date_received: candidate.received,
+    }));
+  }
   return {
-    messages: results.slice(0, args.limit),
+    messages: results,
     scanned_count: scanned,
     result_limit: args.limit,
     scan_truncated: scanned >= maxScanned,

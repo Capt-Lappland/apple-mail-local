@@ -28,6 +28,52 @@ class FakeRunner:
         return json.loads(json.dumps(self.response))
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class ScriptedAutomationRunner(server.AutomationRunner):
+    def __init__(self, responses):
+        super().__init__()
+        self.responses = list(responses)
+        self.calls = 0
+
+    def _run_once(self, payload):
+        self.calls += 1
+        return self.responses.pop(0)
+
+
+def account_record(account_id="a"):
+    return {
+        "id": account_id,
+        "name": "Example",
+        "enabled": True,
+        "account_type": "imap",
+        "email_addresses": ["example@example.com"],
+    }
+
+
+def search_message(locator):
+    return {
+        "_locator": locator,
+        "account_id": locator["account_id"],
+        "mailbox_path": locator["mailbox_path"],
+        "message_id": "header-id",
+        "subject": "Hello",
+        "sender": "Alice <alice@example.com>",
+        "date_received": "2026-08-25T00:00:00.000Z",
+        "date_sent": "2026-08-25T00:00:00.000Z",
+        "is_read": False,
+        "is_flagged": False,
+        "was_replied_to": False,
+        "size_bytes": 123,
+    }
+
+
 class ToolCatalogTests(unittest.TestCase):
     def test_default_catalog_is_read_only(self):
         tools = server.available_tools(False)
@@ -36,6 +82,12 @@ class ToolCatalogTests(unittest.TestCase):
             ["mail_list_accounts", "mail_list_mailboxes", "mail_search_messages", "mail_get_message"],
         )
         self.assertTrue(all(tool["annotations"]["readOnlyHint"] for tool in tools))
+        self.assertTrue(all(tool["outputSchema"]["type"] == "object" for tool in tools))
+
+    def test_catalog_returns_deep_copies(self):
+        tools = server.available_tools(False)
+        tools[0]["annotations"]["readOnlyHint"] = False
+        self.assertTrue(server.available_tools(False)[0]["annotations"]["readOnlyHint"])
 
     def test_draft_tool_requires_opt_in(self):
         tools = server.available_tools(True)
@@ -72,13 +124,87 @@ class ValidationTests(unittest.TestCase):
 
     def test_search_results_get_opaque_refs(self):
         locator = {"account_id": "a", "mailbox_path": ["Inbox"], "message_id": "9"}
-        runner = FakeRunner({"messages": [{"subject": "Hello", "_locator": locator}]})
+        runner = FakeRunner(
+            {
+                "messages": [search_message(locator)],
+                "scanned_count": 1,
+                "result_limit": 20,
+                "scan_truncated": False,
+                "mailbox_limit_reached": False,
+            }
+        )
         result, _ = server.call_tool(
             "mail_search_messages", {}, enable_drafts=False, runner=runner
         )
         message = result["messages"][0]
         self.assertNotIn("_locator", message)
         self.assertEqual(server.decode_message_ref(message["message_ref"]), locator)
+
+
+class EfficiencyTests(unittest.TestCase):
+    def test_account_topology_cache_hits_then_expires(self):
+        clock = FakeClock()
+        cache = server.TopologyCache(ttl_seconds=10, clock=clock)
+        runner = FakeRunner({"accounts": [account_record()]})
+
+        first, _ = server.call_tool(
+            "mail_list_accounts", {}, enable_drafts=False, runner=runner, cache=cache
+        )
+        first["accounts"][0]["id"] = "mutated"
+        second, _ = server.call_tool(
+            "mail_list_accounts", {}, enable_drafts=False, runner=runner, cache=cache
+        )
+        self.assertEqual(second["accounts"][0]["id"], "a")
+        self.assertEqual(len(runner.calls), 1)
+
+        clock.now = 11
+        server.call_tool("mail_list_accounts", {}, enable_drafts=False, runner=runner, cache=cache)
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_malformed_automation_output_fails_closed(self):
+        runner = FakeRunner({"accounts": [{"id": "missing-required-fields"}]})
+        with self.assertRaisesRegex(server.ToolError, "invalid"):
+            server.call_tool("mail_list_accounts", {}, enable_drafts=False, runner=runner)
+
+    def test_message_search_is_never_cached(self):
+        cache = server.TopologyCache()
+        runner = FakeRunner(
+            {
+                "messages": [],
+                "scanned_count": 0,
+                "result_limit": 20,
+                "scan_truncated": False,
+                "mailbox_limit_reached": False,
+            }
+        )
+        for _ in range(2):
+            server.call_tool(
+                "mail_search_messages", {}, enable_drafts=False, runner=runner, cache=cache
+            )
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_transient_apple_event_retries_read_only_operation(self):
+        runner = ScriptedAutomationRunner(
+            [
+                subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"Mail got an error: -609"),
+                subprocess.CompletedProcess([], 0, stdout=b'{"accounts":[]}', stderr=b""),
+            ]
+        )
+        self.assertEqual(runner.run("list_accounts", {}), {"accounts": []})
+        self.assertEqual(runner.calls, 2)
+
+    def test_transient_apple_event_does_not_retry_draft(self):
+        runner = ScriptedAutomationRunner(
+            [subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"Mail got an error: -609")]
+        )
+        with self.assertRaises(server.ToolError):
+            runner.run("create_reply_draft", {})
+        self.assertEqual(runner.calls, 1)
+
+    def test_search_materializes_only_bounded_candidates(self):
+        source = JXA_PATH.read_text(encoding="utf-8")
+        self.assertIn("candidates.slice(0, args.limit)", source)
+        self.assertNotIn("results.push(messageMetadata(message))", source)
 
 
 class SafetyTests(unittest.TestCase):
@@ -133,6 +259,27 @@ class ProtocolTests(unittest.TestCase):
         responses = [json.loads(line) for line in completed.stdout.splitlines()]
         self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "apple-mail-local")
         self.assertEqual(len(responses[1]["result"]["tools"]), 4)
+
+    def test_invalid_jsonrpc_request_is_rejected(self):
+        response = server.handle_request(
+            {"id": 1, "method": "ping"},
+            enable_drafts=False,
+            runner=FakeRunner({}),
+        )
+        self.assertEqual(response["error"]["code"], -32600)
+
+    def test_unsupported_protocol_negotiates_supported_version(self):
+        response = server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "1900-01-01"},
+            },
+            enable_drafts=False,
+            runner=FakeRunner({}),
+        )
+        self.assertEqual(response["result"]["protocolVersion"], server.PROTOCOL_VERSION)
 
 
 if __name__ == "__main__":

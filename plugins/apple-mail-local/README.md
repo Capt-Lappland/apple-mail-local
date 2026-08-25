@@ -119,6 +119,16 @@ ChatGPT/Codex
 
 The project does not parse Mail's private on-disk database and does not run an HTTP server.
 
+## Performance and reliability
+
+- Search reads lightweight fields while scanning, sorts the candidates, and fetches full metadata only for the requested result window. This avoids unnecessary Apple Events when many messages match.
+- Mailbox traversal fetches each child collection once, and message metadata reuses already-read subject, sender, date, account, and mailbox values.
+- Account and mailbox topology responses use a bounded 10-second in-memory cache. Messages, bodies, search results, and drafts are never cached.
+- Transient Mail connection errors (`-600` and `-609`) get one immediate retry for read-only operations. Draft creation is never retried automatically.
+- Every tool has an explicit output schema, malformed automation responses fail closed, and the MCP server validates JSON-RPC requests and negotiates its supported protocol version.
+
+The cache exists only inside the plugin process, contains at most 16 small topology results, and is discarded when the task ends.
+
 ## Development and tests
 
 The normal suite uses mocks and does **not** access Mail:
@@ -130,6 +140,14 @@ The normal suite uses mocks and does **not** access Mail:
 ```
 
 It covers input validation, read-only defaults, draft confirmation, opaque references, forbidden-action checks, MCP initialization/tool listing, and an end-to-end JXA stdin/stdout health check.
+
+Run the control-plane benchmark without opening or reading Mail.app:
+
+```sh
+/usr/bin/python3 ./plugins/apple-mail-local/scripts/benchmark.py --iterations 20
+```
+
+The JSON output reports JXA startup, MCP initialization/tool-list latency, and verifies that repeated topology requests reuse one automation process during the cache window.
 
 An opt-in live smoke test lists account and mailbox data but does not read message bodies:
 
